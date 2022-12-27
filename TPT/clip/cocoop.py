@@ -136,6 +136,7 @@ class CoCoOpPromptLearner(nn.Module):
         
         return prompts
 
+
 class CoCoOpCLIP(nn.Module):
     def __init__(self, device, classnames, criterion='cosine', arch="ViT-L/14",
                         n_ctx=16, ctx_init="a_photo_of_a", ctx_position='end'):
@@ -222,6 +223,7 @@ class CoCoOpCLIP(nn.Module):
             return self.forward_ctx(image_features, ctx)
         else:
             return self.inference(input)
+
 
 def get_cocoop(clip_arch, test_set, device, n_ctx):
     if test_set in fewshot_datasets:

@@ -23,7 +23,7 @@ def save_checkpoint(state, args, is_best=False, filename='checkpoint.pth.tar'):
     torch.save(state, savefile)
     if is_best:
         shutil.copyfile(savefile, bestfile)
-        print ('saved best file')
+        print('saved best file')
 
 
 def assign_learning_rate(optimizer, new_lr):
@@ -68,6 +68,10 @@ def accuracy(output, target, topk=(1,)):
 class AverageMeter(object):
     """Computes and stores the average and current value"""
     def __init__(self, name, fmt=':f'):
+        self.count = None
+        self.sum = None
+        self.avg = None
+        self.val = None
         self.name = name
         self.fmt = fmt
         self.reset()

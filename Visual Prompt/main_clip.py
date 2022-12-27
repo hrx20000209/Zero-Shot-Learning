@@ -19,7 +19,6 @@ from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
 
 
-
 def parse_option():
     parser = argparse.ArgumentParser('Visual Prompting for CLIP')
 
@@ -94,6 +93,7 @@ def parse_option():
 
     return args
 
+
 best_acc1 = 0
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -102,7 +102,7 @@ def main():
     global best_acc1, device
 
     args = parse_option()
-    print (args)
+    print(args)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -166,9 +166,9 @@ def main():
                                 weight_decay=args.weight_decay)
 
     criterion = torch.nn.CrossEntropyLoss().to(device)
-    scaler = GradScaler()
+    scaler = GradScaler()  # 用于降低训练显存的
     total_steps = len(train_loader) * args.epochs
-    scheduler = cosine_lr(optimizer, args.learning_rate, args.warmup, total_steps)
+    scheduler = cosine_lr(optimizer, args.learning_rate, args.warmup, total_steps)  # 调整学习率
 
     cudnn.benchmark = True
 
@@ -284,7 +284,7 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
                 wandb.log({
                     'training_loss': losses.avg,
                     'training_acc': top1.avg
-                     })
+                })
 
         if i % args.save_freq == 0:
             save_checkpoint({

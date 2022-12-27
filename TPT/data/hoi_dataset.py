@@ -7,6 +7,7 @@ import scipy.io as sio
 
 from PIL import Image
 from PIL import ImageFile
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 import torch
@@ -17,15 +18,15 @@ import torchvision.transforms as transforms
 
 try:
     from torchvision.transforms import InterpolationMode
+
     BICUBIC = InterpolationMode.BICUBIC
 except ImportError:
     BICUBIC = Image.BICUBIC
 
 
-
 class BongardDataset(Dataset):
-    def __init__(self, data_root, data_split='unseen_obj_unseen_act', mode='test', 
-                        base_transform=None, query_transform=None, with_annotation=False):
+    def __init__(self, data_root, data_split='unseen_obj_unseen_act', mode='test',
+                 base_transform=None, query_transform=None, with_annotation=False):
         self.base_transform = base_transform
         if query_transform is None:
             self.query_transform = base_transform
@@ -34,7 +35,7 @@ class BongardDataset(Dataset):
         self.data_root = data_root
         self.mode = mode
         self.with_annotation = with_annotation
-        
+
         assert mode in ['val', 'test']
         data_file = os.path.join("data/bongard_splits", "bongard_hoi_{}_{}.json".format(self.mode, data_split))
         self.task_list = []
@@ -48,13 +49,13 @@ class BongardDataset(Dataset):
                     neg_samples.append(sample['im_path'])
                 for sample in task[1]:
                     pos_samples.append(sample['im_path'])
-                
+
                 # random split samples into support and query images (6 vs. 1 for both pos and neg samples) 
                 task_data['pos_samples'] = pos_samples
                 task_data['neg_samples'] = neg_samples
                 task_data['annotation'] = task[-1].replace("++", " ")
                 self.task_list.append(task_data)
-        
+
     def __len__(self):
         return len(self.task_list)
 
@@ -109,8 +110,3 @@ class BongardDataset(Dataset):
             return support_images, query_images, support_labels, query_labels, annotation
         else:
             return support_images, query_images, support_labels, query_labels
-
-
-
-
-            

@@ -35,35 +35,37 @@ ID_to_DIRNAME={
     'eurosat': 'eurosat'
 }
 
+
 def build_dataset(set_id, transform, data_root, mode='test', n_shot=None, split="all", bongard_anno=False):
     if set_id == 'I':
         # ImageNet validation set
-        testdir = os.path.join(os.path.join(data_root, ID_to_DIRNAME[set_id]), 'val')
-        testset = datasets.ImageFolder(testdir, transform=transform)
+        test_dir = os.path.join(os.path.join(data_root, ID_to_DIRNAME[set_id]), 'val')
+        test_set = datasets.ImageFolder(test_dir, transform=transform)
     elif set_id in ['A', 'K', 'R', 'V']:
-        testdir = os.path.join(data_root, ID_to_DIRNAME[set_id])
-        testset = datasets.ImageFolder(testdir, transform=transform)
+        test_dir = os.path.join(data_root, ID_to_DIRNAME[set_id])
+        test_set = datasets.ImageFolder(test_dir, transform=transform)
     elif set_id in fewshot_datasets:
         if mode == 'train' and n_shot:
-            testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
+            test_set = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
         else:
-            testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode)
+            test_set = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode)
     elif set_id == 'bongard':
         assert isinstance(transform, Tuple)
         base_transform, query_transform = transform
-        testset = BongardDataset(data_root, split, mode, base_transform, query_transform, bongard_anno)
+        test_set = BongardDataset(data_root, split, mode, base_transform, query_transform, bongard_anno)
     else:
         raise NotImplementedError
         
-    return testset
+    return test_set
 
 
 # AugMix Transforms
 def get_preaugment():
     return transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+            transforms.RandomResizedCrop(224),      # 随机裁剪成不同大小，再变成224的大小
+            transforms.RandomHorizontalFlip(),      # 给定的概率随机水平旋转给定的PIL的图像
         ])
+
 
 def augmix(image, preprocess, aug_list, severity=1):
     preaugment = get_preaugment()
@@ -71,7 +73,7 @@ def augmix(image, preprocess, aug_list, severity=1):
     x_processed = preprocess(x_orig)
     if len(aug_list) == 0:
         return x_processed
-    w = np.float32(np.random.dirichlet([1.0, 1.0, 1.0]))
+    w = np.float32(np.random.dirichlet([1.0, 1.0, 1.0]))  # 从dirichlet分布中获取随机样本
     m = np.float32(np.random.beta(1.0, 1.0))
 
     mix = torch.zeros_like(x_processed)
