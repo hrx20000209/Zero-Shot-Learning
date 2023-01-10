@@ -7,6 +7,7 @@ from copy import deepcopy
 from PIL import Image
 import numpy as np
 
+import clip
 import torch
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -49,6 +50,57 @@ model_names = sorted(name for name in models.__dict__
                      and callable(models.__dict__[name]))
 
 
+class VisualPrompter(torch.nn.Module):
+    def __init__(self, prompt_size, image_size):
+        super(VisualPrompter, self).__init__()
+        pad_size = prompt_size
+        image_size = image_size
+
+        self.base_size = image_size - pad_size * 2
+        self.pad_up = torch.nn.Parameter(torch.randn([1, 3, pad_size, image_size]))
+        self.pad_down = torch.nn.Parameter(torch.randn([1, 3, pad_size, image_size]))
+        self.pad_left = torch.nn.Parameter(torch.randn([1, 3, image_size - pad_size * 2, pad_size]))
+        self.pad_right = torch.nn.Parameter(torch.randn([1, 3, image_size - pad_size * 2, pad_size]))
+
+    def forward(self, x):
+        base = torch.zeros(1, 3, self.base_size, self.base_size).cuda()
+        prompt = torch.cat([self.pad_left, base, self.pad_right], dim=3)
+        prompt = torch.cat([self.pad_up, prompt, self.pad_down], dim=2)
+        prompt = torch.cat(x.size(0) * [prompt])
+
+        return x + prompt
+
+
+def convert_models_to_fp32(model):
+    for p in model.parameters():
+        p.data = p.data.float()
+        if p.grad:
+            p.grad.data = p.grad.data.float()
+
+
+def assign_learning_rate(optimizer, new_lr):
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = new_lr
+
+
+def _warmup_lr(base_lr, warmup_length, step):
+    return base_lr * (step + 1) / warmup_length
+
+
+def cosine_lr(optimizer, base_lr, warmup_length, steps):
+    def _lr_adjuster(step):
+        if step < warmup_length:
+            lr = _warmup_lr(base_lr, warmup_length, step)
+        else:
+            e = step - warmup_length
+            es = steps - warmup_length
+            lr = 0.5 * (1 + np.cos(np.pi * e / es)) * base_lr
+        assign_learning_rate(optimizer, lr)
+        return lr
+
+    return _lr_adjuster
+
+
 def select_confident_samples(logits, top):
     batch_entropy = -(logits.softmax(1) * logits.log_softmax(1)).sum(1)
     idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * top)]
@@ -72,6 +124,8 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
     selected_idx = None
     for j in range(args.tta_steps):
         with torch.cuda.amp.autocast():
+            if args.modal_choice == 2:
+                inputs = model.visual_prompter(inputs)
             if args.cocoop:
                 output = model((image_feature, pgen_ctx))
             else:
@@ -94,6 +148,13 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
         return pgen_ctx
 
     return
+
+
+def test_time_tuning_visual(model, inputs, args):
+    inputs = model.visual_prompter(inputs)
+    output = model(inputs)
+    output, selected_idx = select_confident_samples(output, args.selection_p)
+    return selected_idx
 
 
 def main():
@@ -153,9 +214,13 @@ def main_worker(gpu, args):
         optimizer = None
         optim_state = None
     else:
-        trainable_param = model.prompt_learner.parameters()
-        optimizer = torch.optim.AdamW(trainable_param, args.lr)
-        optim_state = deepcopy(optimizer.state_dict())
+        if args.modal_choice == 1:
+            print("=> Train text prompt in test time")
+            trainable_param = model.prompt_learner.parameters()
+            optimizer = torch.optim.AdamW(trainable_param, args.lr)
+            optim_state = deepcopy(optimizer.state_dict())
+        elif args.modal_choice == 2:
+            print("=> Train visual prompt in test time")
 
     # setup automatic mixed-precision (Amp) loss scaling
     scaler = torch.cuda.amp.GradScaler(init_scale=1000)
@@ -226,8 +291,7 @@ def main_worker(gpu, args):
             batch_size=batchsize, shuffle=True,
             num_workers=args.workers, pin_memory=True)
 
-        results[set_id] = test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state, scaler, args,
-                                               model)
+        results[set_id] = test_time_adapt_eval(val_loader, model, model_state, scaler, args, classnames, model)
         del val_dataset, val_loader
         try:
             print("=> Acc. on testset [{}]: @1 {}/ @5 {}".format(set_id, results[set_id][0], results[set_id][1]))
@@ -238,15 +302,15 @@ def main_worker(gpu, args):
     print("params: nstep	lr	bs")
     print("params: {}	{}	{}".format(args.tta_steps, args.lr, args.batch_size))
     print("\t\t [set_id] \t\t Top-1 acc. \t\t Top-5 acc.")
-    for id in results.keys():
-        print("{}".format(id), end="	")
+    for i in results.keys():
+        print("{}".format(i), end="	")
     print("\n")
-    for id in results.keys():
-        print("{:.2f}".format(results[id][0]), end="	")
+    for i in results.keys():
+        print("{:.2f}".format(results[i][0]), end="	")
     print("\n")
 
 
-def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state, scaler, args, clip_model=None):
+def test_time_adapt_eval(val_loader, model, model_state, scaler, args, class_names, clip_model=None):
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
     top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
@@ -263,40 +327,28 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
             model.reset()
     end = time.time()
 
-    # load visual prompt model
-    if args.is_EVP:
-        print("===> Using EVP method")
-        device = "cuda:{}".format(args.gpu)
-        # visual prompt
-        # visual_prompter = prompters.__dict__[args.method](args).to(device)
-        # vp_model_name = args.vp_root.split('/')[-1]
-        # visual_prompter_dict = torch.load(args.vp_root)["state_dict"]
-        # visual_prompter.load_state_dict(visual_prompter_dict)
-        # visual_prompter.eval()
+    device = 'cuda'
+    my_model, _, _ = clip.load("ViT-B/32", device=device, download_root='~/.cache/clip')
+    # my_model = load('ViT-B/32', device, jit=False)
+    convert_models_to_fp32(my_model)
+    my_model.eval()
 
-        # EVP
-        visual_prompter = Pertubation(30, 30, clip_model)
-        state_dict = torch.load("../EVP/save/models/checkpoint_best.pth", map_location="cuda:0")
-        perturbation_state = visual_prompter.state_dict()
-        perturbation_state["perturbation"] = state_dict["perturbation"]
-        visual_prompter.load_state_dict(perturbation_state)
+    visual_prompter = VisualPrompter(30, 224).to(device)
 
-        # print("=> loading visual prompt model '{}'".format(vp_model_name))
-        # else:
-        #     print("=> no visual prompt model found at '{}'".format(args.resume))
-    else:
-        print("=> not use visual prompt")
+    criterion = torch.nn.CrossEntropyLoss().to(device)
+    visual_prompter.train()
 
+    optimizer = torch.optim.SGD(visual_prompter.parameters(),
+                                lr=40,
+                                momentum=0.9,
+                                weight_decay=0)
+    scheduler = cosine_lr(optimizer, 40, 1000, len(val_loader))
+    result_image = None
     for i, (images, target) in enumerate(val_loader):
-        # if args.vp_root:
-        #     images = visual_prompter(images)
         assert args.gpu is not None
         if isinstance(images, list):
             for k in range(len(images)):
                 images[k] = images[k].cuda(args.gpu, non_blocking=True)
-                # visual prompter
-                # if args.is_EVP:
-                #     images[k] = visual_prompter(images[k])
 
             image = images[0]
         else:
@@ -305,9 +357,6 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
                 assert images.size()[0] == 1
                 images = images.squeeze(0)
             images = images.cuda(args.gpu, non_blocking=True)
-            # visual prompter
-            # if args.is_EVP:
-            #     images = visual_prompter(images)
             image = images
             # save_image(image, './pic/test_2.jpg', normalize=True)
 
@@ -316,34 +365,74 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
             images = torch.cat(images, dim=0)
 
         # reset the tunable prompt to its initial state
-        if not args.cocoop:  # no need to reset cocoop because it's fixed
-            if args.tta_steps > 0:
+        # if not args.cocoop:  # no need to reset cocoop because it's fixed
+        #     if args.tta_steps > 0:
+        #         with torch.no_grad():
+        #             model.reset()
+        #     optimizer.load_state_dict(optim_state)
+        #     test_time_tuning(model, images, optimizer, scaler, args)
+        # else:
+        #     with torch.no_grad():
+        #         with torch.cuda.amp.autocast():
+        #             image_feature, pgen_ctx = model.gen_ctx(images, args.tpt)
+        #     optimizer = None
+        #     pgen_ctx = test_time_tuning(model, (image_feature, pgen_ctx), optimizer, scaler, args)
+        #
+        # # The actual inference goes here
+        # if args.tpt:
+        #     if args.cocoop:
+        #         image_feature = image_feature[0].unsqueeze(0)
+        #
+        # with torch.no_grad():
+        #     with torch.cuda.amp.autocast():
+        #         if args.cocoop:
+        #             output = model((image_feature, pgen_ctx))
+        #         else:
+        #             output = model(image)
+
+        if args.modal_choice == 2:
+            optimizer.zero_grad()
+
+            scheduler(i)
+            # text_tokens = model.text_encoder(target, model.prompt_learner.tokenized_prompts).to('cuda:0')
+            template = 'This is a photo of a {}'
+            texts = [template.format(label) for label in class_names]
+
+            images = images.to(device)
+            text_tokens = clip.tokenize(texts).to(device)
+
+            # with torch.cuda.amp.autocast():
+            idx = test_time_tuning_visual(model, images, args)
+            if i == 0:
+                result_image = images
+                save_image(visual_prompter(result_image), './pic/prompted_image.png')
+            for j in range(len(idx)):
+                item = images[idx[j]]
+                # save_image(item, './pic/test_{}.png'.format(j))
+                prompted_image = visual_prompter(item)
                 with torch.no_grad():
-                    model.reset()
-            optimizer.load_state_dict(optim_state)
-            test_time_tuning(model, images, optimizer, scaler, args)
-        else:
-            with torch.no_grad():
-                with torch.cuda.amp.autocast():
-                    image_feature, pgen_ctx = model.gen_ctx(images, args.tpt)
-            optimizer = None
-            pgen_ctx = test_time_tuning(model, (image_feature, pgen_ctx), optimizer, scaler, args)
+                    image_features = my_model.encode_image(prompted_image)
+                    text_features = my_model.encode_text(text_tokens)
 
-        # The actual inference goes here
-        if args.tpt:
-            if args.cocoop:
-                image_feature = image_feature[0].unsqueeze(0)
+                    logits_per_image, logits_per_text = my_model(prompted_image, text_tokens)
+                    probs = logits_per_image.softmax(dim=-1).cpu().numpy()
 
-        with torch.no_grad():
-            with torch.cuda.amp.autocast():
-                if args.cocoop:
-                    output = model((image_feature, pgen_ctx))
-                else:
-                    if args.is_EVP:
-                        image = visual_prompter(image)
-                    output = model(image)
+                # output, _ = my_model(prompted_image, text_tokens)
+                ground_truth = torch.cat((target, target, target), 0)
+                # print(ground_truth)
+                loss = criterion(logits_per_image, ground_truth)
+                # print(loss)
+                loss.requires_grad_(True)
+                loss.backward()
+                optimizer.step()
+                # scaler.scale(loss).backward()
+                # scaler.step(optimizer)
+            # scaler.update()
+
+            model.logit_scale.data = torch.clamp(model.logit_scale.data, 0, 4.6052)
+
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1, acc5 = accuracy(logits_per_image, target, topk=(1, 5))
 
         top1.update(acc1[0], image.size(0))
         top5.update(acc5[0], image.size(0))
@@ -356,6 +445,9 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
             progress.display(i)
 
     progress.display_summary()
+
+    result = visual_prompter(result_image)
+    save_image(prompted_image, './pic/image_result.png')
 
     return [top1.avg, top5.avg]
 
@@ -386,6 +478,8 @@ if __name__ == '__main__':
                         help="use cocoop's output as prompt initialization")
     parser.add_argument('--load', default=None, type=str, help='path to a pre-trained coop/cocoop')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--modal_choice', type=int, default=1, help='Tuning method choice(default: 1): '
+                                                                    '1.text 2.visual 3.both')
 
     # visual prompt argument
     parser.add_argument('--vp_root', default=None, type=str, help='path to a trained visual prompter')

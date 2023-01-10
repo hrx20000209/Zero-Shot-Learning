@@ -70,7 +70,7 @@ def rotate(pil_img, level):
   degrees = int_parameter(sample_level(level), 30)
   if np.random.uniform() > 0.5:
     degrees = -degrees
-  return pil_img.rotate(degrees, resample=Image.BILINEAR)
+  return pil_img.rotate(degrees, resample=Image.Resampling.BILINEAR)
 
 
 def solarize(pil_img, level):
@@ -84,7 +84,7 @@ def shear_x(pil_img, level):
     level = -level
   return pil_img.transform((IMAGE_SIZE, IMAGE_SIZE),
                            Image.AFFINE, (1, level, 0, 0, 1, 0),
-                           resample=Image.BILINEAR)
+                           resample=Image.Resampling.BILINEAR)
 
 
 def shear_y(pil_img, level):
@@ -93,7 +93,7 @@ def shear_y(pil_img, level):
     level = -level
   return pil_img.transform((IMAGE_SIZE, IMAGE_SIZE),
                            Image.AFFINE, (1, 0, 0, level, 1, 0),
-                           resample=Image.BILINEAR)
+                           resample=Image.Resampling.BILINEAR)
 
 
 def translate_x(pil_img, level):
@@ -102,7 +102,7 @@ def translate_x(pil_img, level):
     level = -level
   return pil_img.transform((IMAGE_SIZE, IMAGE_SIZE),
                            Image.AFFINE, (1, 0, level, 0, 1, 0),
-                           resample=Image.BILINEAR)
+                           resample=Image.Resampling.BILINEAR)
 
 
 def translate_y(pil_img, level):
@@ -111,7 +111,7 @@ def translate_y(pil_img, level):
     level = -level
   return pil_img.transform((IMAGE_SIZE, IMAGE_SIZE),
                            Image.AFFINE, (1, 0, 0, 0, 1, level),
-                           resample=Image.BILINEAR)
+                           resample=Image.Resampling.BILINEAR)
 
 
 # operation that overlaps with ImageNet-C's test set

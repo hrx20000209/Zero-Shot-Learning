@@ -9,11 +9,11 @@ class PadPrompter(nn.Module):
         pad_size = args.prompt_size
         image_size = args.image_size
 
-        self.base_size = image_size - pad_size*2
+        self.base_size = image_size - pad_size * 2
         self.pad_up = nn.Parameter(torch.randn([1, 3, pad_size, image_size]))
         self.pad_down = nn.Parameter(torch.randn([1, 3, pad_size, image_size]))
-        self.pad_left = nn.Parameter(torch.randn([1, 3, image_size - pad_size*2, pad_size]))
-        self.pad_right = nn.Parameter(torch.randn([1, 3, image_size - pad_size*2, pad_size]))
+        self.pad_left = nn.Parameter(torch.randn([1, 3, image_size - pad_size * 2, pad_size]))
+        self.pad_right = nn.Parameter(torch.randn([1, 3, image_size - pad_size * 2, pad_size]))
 
     def forward(self, x):
         base = torch.zeros(1, 3, self.base_size, self.base_size).cuda()

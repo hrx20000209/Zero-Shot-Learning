@@ -14,7 +14,8 @@ from data.cls_to_names import *
 
 _tokenizer = _Tokenizer()
 
-DOWNLOAD_ROOT='~/.cache/clip'
+DOWNLOAD_ROOT = '~/.cache/clip'
+
 
 class ClipImageEncoder(nn.Module):
     def __init__(self, device, arch="ViT-L/14", image_resolution=224, n_class=1000):
@@ -104,9 +105,9 @@ class PromptLearner(nn.Module):
 
         # batch-wise prompt tuning for test-time adaptation
         if self.batch_size is not None: 
-            ctx_vectors = ctx_vectors.repeat(batch_size, 1, 1)  #(N, L, D)
+            ctx_vectors = ctx_vectors.repeat(batch_size, 1, 1)  # (N, L, D)
         self.ctx_init_state = ctx_vectors.detach().clone()
-        self.ctx = nn.Parameter(ctx_vectors) # to be optimized
+        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
 
         if not self.learned_cls:
             classnames = [name.replace("_", " ") for name in classnames]
@@ -114,14 +115,14 @@ class PromptLearner(nn.Module):
             prompts = [prompt_prefix + " " + name + "." for name in classnames]
         else:
             print("Random initialization: initializing a learnable class token")
-            cls_vectors = torch.empty(n_cls, 1, ctx_dim, dtype=dtype) # assume each learnable cls_token is only 1 word
+            cls_vectors = torch.empty(n_cls, 1, ctx_dim, dtype=dtype)  # assume each learnable cls_token is only 1 word
             nn.init.normal_(cls_vectors, std=0.02)
             cls_token = "X"
             name_lens = [1 for _ in classnames]
             prompts = [prompt_prefix + " " + cls_token + "." for _ in classnames]
 
             self.cls_init_state = cls_vectors.detach().clone()
-            self.cls = nn.Parameter(cls_vectors) # to be optimized
+            self.cls = nn.Parameter(cls_vectors)  # to be optimized
 
         tokenized_prompts = torch.cat([tokenize(p) for p in prompts]).to(self.device)
         with torch.no_grad():
@@ -146,7 +147,7 @@ class PromptLearner(nn.Module):
 
     def reset(self):
         ctx_vectors = self.ctx_init_state
-        self.ctx.copy_(ctx_vectors) # to be optimized
+        self.ctx.copy_(ctx_vectors)  # to be optimized
         if self.learned_cls:
             cls_vectors = self.cls_init_state
             self.cls.copy_(cls_vectors)
@@ -158,7 +159,7 @@ class PromptLearner(nn.Module):
             name_lens = [len(_tokenizer.encode(name)) for name in classnames]
             prompts = [self.prompt_prefix + " " + name + "." for name in classnames]
         else:
-            cls_vectors = torch.empty(self.n_cls, 1, self.ctx_dim, dtype=self.dtype) # assume each learnable cls_token is only 1 word
+            cls_vectors = torch.empty(self.n_cls, 1, self.ctx_dim, dtype=self.dtype)  # assume each learnable cls_token is only 1 word
             nn.init.normal_(cls_vectors, std=0.02)
             cls_token = "X"
             name_lens = [1 for _ in classnames]
@@ -224,7 +225,7 @@ class PromptLearner(nn.Module):
         elif self.class_token_position == "middle":
             # TODO: to work with a batch of prompts
             if self.split_idx is not None:
-                half_n_ctx = self.split_idx # split the ctx at the position of [CLS] in `ctx_init`
+                half_n_ctx = self.split_idx  # split the ctx at the position of [CLS] in `ctx_init`
             else:
                 half_n_ctx = self.n_ctx // 2
             prompts = []
@@ -274,6 +275,49 @@ class PromptLearner(nn.Module):
         return prompts
 
 
+class PadPrompter(nn.Module):
+    def __init__(self, prompt_size, image_size):
+        super(PadPrompter, self).__init__()
+        self.pad_size = prompt_size
+        self.image_size = image_size
+
+        self.base_size = image_size - self.pad_size * 2
+
+        pad_up = torch.randn([1, 3, self.pad_size, self.image_size])
+        self.pad_up_init_state = pad_up.detach().clone()
+        self.pad_up = nn.Parameter(pad_up)  # to be optimized
+
+        pad_down = torch.randn([1, 3, self.pad_size, self.image_size])
+        self.pad_down_init_state = pad_down.detach().clone()
+        self.pad_down = nn.Parameter(pad_down)  # to be optimized
+
+        pad_left = torch.randn([1, 3, self.image_size - self.pad_size * 2, self.pad_size])
+        self.pad_left_init_state = pad_left.detach().clone()
+        self.pad_left = nn.Parameter(pad_left)  # to be optimized
+
+        pad_right = torch.randn([1, 3, self.image_size - self.pad_size * 2, self.pad_size])
+        self.pad_right_init_state = pad_right.detach().clone()
+        self.pad_right = nn.Parameter(pad_right)  # to be optimized
+
+    def forward(self, x):
+        base = torch.zeros(1, 3, self.base_size, self.base_size).cuda()
+        prompt = torch.cat([self.pad_left, base, self.pad_right], dim=3)
+        prompt = torch.cat([self.pad_up, prompt, self.pad_down], dim=2)
+        prompt = torch.cat(x.size(0) * [prompt])
+
+        return x + prompt
+
+    def reset(self):
+        pad_up = self.pad_up_init_state
+        self.pad_up.copy_(pad_up)
+        pad_down = self.pad_down_init_state
+        self.pad_down.copy_(pad_down)
+        pad_left = self.pad_left_init_state
+        self.pad_left.copy_(pad_left)
+        pad_right = self.pad_right_init_state
+        self.pad_right.copy_(pad_right)
+
+
 class ClipTestTimeTuning(nn.Module):
     def __init__(self, device, classnames, batch_size, criterion='cosine', arch="ViT-L/14",
                         n_ctx=16, ctx_init=None, ctx_position='end', learned_cls=False):
@@ -284,6 +328,7 @@ class ClipTestTimeTuning(nn.Module):
         self.logit_scale = clip.logit_scale.data
         # prompt tuning
         self.prompt_learner = PromptLearner(clip, classnames, batch_size, n_ctx, ctx_init, ctx_position, learned_cls)
+        self.visual_prompter = PadPrompter(30, 224)
         self.criterion = criterion
         
     @property
@@ -293,6 +338,7 @@ class ClipTestTimeTuning(nn.Module):
     # restore the initial state of the prompt_learner (tunable prompt)
     def reset(self):
         self.prompt_learner.reset()
+        self.visual_prompter.reset()
 
     def reset_classnames(self, classnames, arch):
         self.prompt_learner.reset_classnames(classnames, arch)

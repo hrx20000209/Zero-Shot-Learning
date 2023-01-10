@@ -141,19 +141,19 @@ def main():
     template = 'This is a photo of a {}'
     print(f'template: {template}')
 
-    train_dataset = CIFAR100(args.root, transform=preprocess,
-                             download=True, train=True)
-
-    val_dataset = CIFAR100(args.root, transform=preprocess,
-                           download=True, train=False)
-
-    train_loader = DataLoader(train_dataset,
-                              batch_size=args.batch_size, pin_memory=True,
-                              num_workers=args.num_workers, shuffle=True)
-
-    val_loader = DataLoader(val_dataset,
-                            batch_size=args.batch_size, pin_memory=True,
-                            num_workers=args.num_workers, shuffle=False)
+    # train_dataset = CIFAR100(args.root, transform=preprocess,
+    #                          download=True, train=True)
+    #
+    # val_dataset = CIFAR100(args.root, transform=preprocess,
+    #                        download=True, train=False)
+    #
+    # train_loader = DataLoader(train_dataset,
+    #                           batch_size=args.batch_size, pin_memory=True,
+    #                           num_workers=args.num_workers, shuffle=True)
+    #
+    # val_loader = DataLoader(val_dataset,
+    #                         batch_size=args.batch_size, pin_memory=True,
+    #                         num_workers=args.num_workers, shuffle=False)
 
     class_names = train_dataset.classes
     class_names = refine_classname(class_names)
