@@ -1,15 +1,15 @@
-from __future__ import print_function
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 import argparse
-import os
 from tqdm import tqdm
 import time
 import random
-import wandb
+# import wandb
 
 import torch
 import torch.backends.cudnn as cudnn
-import scipy.io as sio
 import numpy as np
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -19,86 +19,7 @@ from models import prompters
 from PIL import Image
 from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
-
-
-def get_path(image_files):
-    image_files = np.squeeze(image_files)
-    new_image_files = []
-    for image_file in image_files:
-        image_file = image_file[0]
-        image_file = '/'.join(image_file.split('/')[8:])
-        new_image_files.append(image_file)
-    new_image_files = np.array(new_image_files)
-    return new_image_files
-
-
-class MyDataset(torch.utils.data.Dataset):
-    """ Zero-Shot Benchmark dataset """
-
-    def __init__(self, root, dataset, preprocess, mode='train', n_shot=None, transform=None):
-        self.transform = transform
-        self.path = root
-        self.dataset = dataset
-        self.mode = mode
-        self.preprocess = preprocess
-
-        matcontent = sio.loadmat(os.path.join(self.path, "xlsa17/data/", self.dataset, 'res101.mat'))
-        image_files = get_path(matcontent['image_files'])
-        labels = matcontent['labels'].astype(int).squeeze() - 1
-        matcontent = sio.loadmat(os.path.join(self.path, "xlsa17/data/", self.dataset, 'att_splits.mat'))
-        trainval_loc = matcontent['trainval_loc'].squeeze() - 1
-        test_seen_loc = matcontent['test_seen_loc'].squeeze() - 1
-        test_unseen_loc = matcontent['test_unseen_loc'].squeeze() - 1
-
-        test_seen_label = labels[test_seen_loc].astype(int)
-        self.seenclasses = np.unique(test_seen_label)
-        test_unseen_label = labels[test_unseen_loc].astype(int)
-        self.unseenclasses = np.unique(test_unseen_label)
-        self.allclasses = np.arange(len(self.seenclasses) + len(self.unseenclasses))
-
-        self.cname = []
-        allclasses_names = matcontent['allclasses_names']
-        for item in allclasses_names:
-            name = item[0][0]
-            if dataset == 'AWA2':
-                name = name.strip().replace('+', ' ')
-            elif dataset == 'CUB':
-                name = name.strip().split('.')[1].replace('_', ' ')
-            elif dataset == 'SUN':
-                name = name.strip().replace('_', ' ')
-            self.cname.append(name)
-
-        if self.mode == 'train':
-            self.image_list = list(image_files[trainval_loc])
-            self.label_list = list(labels[trainval_loc])
-        elif self.mode == 'seen':
-            self.image_list = list(image_files[test_seen_loc])
-            self.label_list = list(labels[test_seen_loc])
-        elif self.mode == 'unseen':
-            self.image_list = list(image_files[test_unseen_loc])
-            self.label_list = list(labels[test_unseen_loc])
-
-        if n_shot is not None:
-            few_shot_samples = []
-            c_range = max(self.label_list) + 1
-            for c in range(c_range):
-                c_idx = [idx for idx, lable in enumerate(self.label_list) if lable == c]
-                random.seed(0)
-                few_shot_samples.extend(random.sample(c_idx, n_shot))
-            self.image_list = [self.image_list[i] for i in few_shot_samples]
-            self.label_list = [self.label_list[i] for i in few_shot_samples]
-
-    def __len__(self):
-        return len(self.image_list)
-
-    def __getitem__(self, idx):
-        image_path = os.path.join(self.path, self.dataset, 'images', self.image_list[idx])
-        image = self.preprocess(Image.open(image_path).convert('RGB'))
-        label = self.label_list[idx]
-        if self.transform:
-            image = self.transform(image)
-
-        return image, torch.tensor(label).long()
+from myDataset import ZeroShotDataset, TestDataset
 
 
 def parse_option():
@@ -140,7 +61,7 @@ def parse_option():
     # dataset
     parser.add_argument('--root', type=str, default='../../dataset',
                         help='dataset')
-    parser.add_argument('--dataset', type=str, default='CUB',
+    parser.add_argument('--dataset', type=str, default='flowers-102',
                         help='dataset')
     parser.add_argument('--image_size', type=int, default=224,
                         help='image size')
@@ -177,7 +98,7 @@ def parse_option():
 
 
 best_acc1 = 0
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
 def main():
@@ -192,7 +113,8 @@ def main():
         cudnn.deterministic = True
 
     # create model
-    model, preprocess = clip.load('ViT-B/16', device, jit=False)
+    model, preprocess = clip.load(args.arch, device, jit=False)
+    print("loading clip model: {}".format(args.arch))
     convert_models_to_fp32(model)
     model.eval()
 
@@ -223,10 +145,14 @@ def main():
     template = 'This is a photo of a {}'
     print(f'template: {template}')
 
-    train_dataset = MyDataset(args.root, args.dataset, preprocess)
+    # train_dataset = ZeroShotDataset(args.root, args.dataset, preprocess)
 
-    test_seen_dataset = MyDataset(args.root, args.dataset, preprocess, mode='seen')
-    test_unseen_dataset = MyDataset(args.root, args.dataset, preprocess, mode='unseen')
+    # test_seen_dataset = ZeroShotDataset(args.root, args.dataset, preprocess, mode='seen')
+    # test_unseen_dataset = ZeroShotDataset(args.root, args.dataset, preprocess, mode='unseen')
+
+    train_dataset = TestDataset(args.root, args.dataset, preprocess)
+    test_seen_dataset = TestDataset(args.root, args.dataset, preprocess, mode='seen')
+    test_unseen_dataset = TestDataset(args.root, args.dataset, preprocess, mode='unseen')
 
     train_loader = DataLoader(train_dataset,
                               batch_size=args.batch_size, pin_memory=True,
@@ -241,8 +167,9 @@ def main():
 
     print("build data loader successfully")
 
-    class_names = train_dataset.cname
-    class_names = refine_classname(class_names)
+    # class_names = train_dataset.cname
+    # class_names = refine_classname(class_names)
+    class_names = train_dataset.classnames
     texts = [template.format(label) for label in class_names]
 
     # define criterion and optimizer
@@ -351,11 +278,13 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
         text_tokens = clip.tokenize(texts).to(device)
 
         np_target = target.cpu().numpy()
-        gt = np.zeros(shape=(len(np_target), len(data_set.seenclasses) + len(data_set.unseenclasses)))
+        # gt = np.zeros(shape=(len(np_target), len(data_set.seenclasses) + len(data_set.unseenclasses)))
+        gt = np.zeros(shape=(len(np_target), len(data_set.classnames_dict)))
         for j in range(len(np_target)):
             gt[j][np_target[j]] = 1
-        sampled_classes = data_set.seenclasses
+        # sampled_classes = data_set.seenclasses
         # sampled_classes, inverse_ind = np.unique(np_target, return_inverse=True)
+        sampled_classes = data_set.labels
         gt = gt[:, sampled_classes]
         ground_truth = torch.from_numpy(gt).float().to(target.device)
 
@@ -441,11 +370,11 @@ def validate(val_loader, texts, model, prompter, criterion, args, data_type):
             # acc1 = accuracy(output_prompt, target, topk=(1,))
             acc1 = cal_acc_per_class(predicted_prompt, label)
             losses.update(loss.item(), images.size(0))
-            top1_prompt.update(acc1[0].item(), images.size(0))
+            top1_prompt.update(acc1, images.size(0))
 
             # acc1 = accuracy(output_org, target, topk=(1,))
             acc1 = cal_acc_per_class(predicted_org, label)
-            top1_org.update(acc1[0].item(), images.size(0))
+            top1_org.update(acc1, images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
