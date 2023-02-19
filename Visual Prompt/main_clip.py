@@ -9,14 +9,96 @@ import wandb
 
 import torch
 import torch.backends.cudnn as cudnn
+import scipy.io as sio
+import numpy as np
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torchvision.datasets import CIFAR100
 
 import clip
 from models import prompters
+from PIL import Image
 from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint
 from utils import cosine_lr, convert_models_to_fp32, refine_classname
+
+
+def get_path(image_files):
+    image_files = np.squeeze(image_files)
+    new_image_files = []
+    for image_file in image_files:
+        image_file = image_file[0]
+        image_file = '/'.join(image_file.split('/')[8:])
+        new_image_files.append(image_file)
+    new_image_files = np.array(new_image_files)
+    return new_image_files
+
+
+class MyDataset(torch.utils.data.Dataset):
+    """ Zero-Shot Benchmark dataset """
+
+    def __init__(self, root, dataset, preprocess, mode='train', n_shot=None, transform=None):
+        self.transform = transform
+        self.path = root
+        self.dataset = dataset
+        self.mode = mode
+        self.preprocess = preprocess
+
+        matcontent = sio.loadmat(os.path.join(self.path, "xlsa17/data/", self.dataset, 'res101.mat'))
+        image_files = get_path(matcontent['image_files'])
+        labels = matcontent['labels'].astype(int).squeeze() - 1
+        matcontent = sio.loadmat(os.path.join(self.path, "xlsa17/data/", self.dataset, 'att_splits.mat'))
+        trainval_loc = matcontent['trainval_loc'].squeeze() - 1
+        test_seen_loc = matcontent['test_seen_loc'].squeeze() - 1
+        test_unseen_loc = matcontent['test_unseen_loc'].squeeze() - 1
+
+        test_seen_label = labels[test_seen_loc].astype(int)
+        self.seenclasses = np.unique(test_seen_label)
+        test_unseen_label = labels[test_unseen_loc].astype(int)
+        self.unseenclasses = np.unique(test_unseen_label)
+        self.allclasses = np.arange(len(self.seenclasses) + len(self.unseenclasses))
+
+        self.cname = []
+        allclasses_names = matcontent['allclasses_names']
+        for item in allclasses_names:
+            name = item[0][0]
+            if dataset == 'AWA2':
+                name = name.strip().replace('+', ' ')
+            elif dataset == 'CUB':
+                name = name.strip().split('.')[1].replace('_', ' ')
+            elif dataset == 'SUN':
+                name = name.strip().replace('_', ' ')
+            self.cname.append(name)
+
+        if self.mode == 'train':
+            self.image_list = list(image_files[trainval_loc])
+            self.label_list = list(labels[trainval_loc])
+        elif self.mode == 'seen':
+            self.image_list = list(image_files[test_seen_loc])
+            self.label_list = list(labels[test_seen_loc])
+        elif self.mode == 'unseen':
+            self.image_list = list(image_files[test_unseen_loc])
+            self.label_list = list(labels[test_unseen_loc])
+
+        if n_shot is not None:
+            few_shot_samples = []
+            c_range = max(self.label_list) + 1
+            for c in range(c_range):
+                c_idx = [idx for idx, lable in enumerate(self.label_list) if lable == c]
+                random.seed(0)
+                few_shot_samples.extend(random.sample(c_idx, n_shot))
+            self.image_list = [self.image_list[i] for i in few_shot_samples]
+            self.label_list = [self.label_list[i] for i in few_shot_samples]
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, idx):
+        image_path = os.path.join(self.path, self.dataset, 'images', self.image_list[idx])
+        image = self.preprocess(Image.open(image_path).convert('RGB'))
+        label = self.label_list[idx]
+        if self.transform:
+            image = self.transform(image)
+
+        return image, torch.tensor(label).long()
 
 
 def parse_option():
@@ -48,7 +130,7 @@ def parse_option():
 
     # model
     parser.add_argument('--model', type=str, default='clip')
-    parser.add_argument('--arch', type=str, default='vit_b32')
+    parser.add_argument('--arch', type=str, default='ViT-B/16')
     parser.add_argument('--method', type=str, default='padding',
                         choices=['padding', 'random_patch', 'fixed_patch'],
                         help='choose visual prompting method')
@@ -56,9 +138,9 @@ def parse_option():
                         help='size for visual prompts')
 
     # dataset
-    parser.add_argument('--root', type=str, default='./data',
+    parser.add_argument('--root', type=str, default='../../dataset',
                         help='dataset')
-    parser.add_argument('--dataset', type=str, default='cifar100',
+    parser.add_argument('--dataset', type=str, default='CUB',
                         help='dataset')
     parser.add_argument('--image_size', type=int, default=224,
                         help='image size')
@@ -110,7 +192,7 @@ def main():
         cudnn.deterministic = True
 
     # create model
-    model, preprocess = clip.load('ViT-B/32', device, jit=False)
+    model, preprocess = clip.load('ViT-B/16', device, jit=False)
     convert_models_to_fp32(model)
     model.eval()
 
@@ -141,21 +223,25 @@ def main():
     template = 'This is a photo of a {}'
     print(f'template: {template}')
 
-    # train_dataset = CIFAR100(args.root, transform=preprocess,
-    #                          download=True, train=True)
-    #
-    # val_dataset = CIFAR100(args.root, transform=preprocess,
-    #                        download=True, train=False)
-    #
-    # train_loader = DataLoader(train_dataset,
-    #                           batch_size=args.batch_size, pin_memory=True,
-    #                           num_workers=args.num_workers, shuffle=True)
-    #
-    # val_loader = DataLoader(val_dataset,
-    #                         batch_size=args.batch_size, pin_memory=True,
-    #                         num_workers=args.num_workers, shuffle=False)
+    train_dataset = MyDataset(args.root, args.dataset, preprocess)
 
-    class_names = train_dataset.classes
+    test_seen_dataset = MyDataset(args.root, args.dataset, preprocess, mode='seen')
+    test_unseen_dataset = MyDataset(args.root, args.dataset, preprocess, mode='unseen')
+
+    train_loader = DataLoader(train_dataset,
+                              batch_size=args.batch_size, pin_memory=True,
+                              num_workers=args.num_workers, shuffle=True)
+
+    test_seen_loader = DataLoader(test_seen_dataset,
+                                  batch_size=args.batch_size, pin_memory=True,
+                                  num_workers=args.num_workers, shuffle=False)
+    test_unseen_loader = DataLoader(test_unseen_dataset,
+                                    batch_size=args.batch_size, pin_memory=True,
+                                    num_workers=args.num_workers, shuffle=False)
+
+    print("build data loader successfully")
+
+    class_names = train_dataset.cname
     class_names = refine_classname(class_names)
     texts = [template.format(label) for label in class_names]
 
@@ -188,22 +274,29 @@ def main():
         wandb.watch(prompter, criterion, log='all', log_freq=10)
 
     if args.evaluate:
-        acc1 = validate(val_loader, texts, model, prompter, criterion, args)
+        acc1 = validate(test_seen_loader, texts, model, prompter, criterion, args, "seen")
+        acc2 = validate(test_unseen_loader, texts, model, prompter, criterion, args, "unseen")
         return
 
     epochs_since_improvement = 0
 
+    print('==== Begin Training ====')
+
     for epoch in range(args.epochs):
 
         # train for one epoch
-        train(train_loader, texts, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args)
+        train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
+              scaler, epoch, train_dataset, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, texts, model, prompter, criterion, args)
+        acc1 = validate(test_seen_loader, texts, model, prompter, criterion, args, "seen")
+        acc2 = validate(test_unseen_loader, texts, model, prompter, criterion, args, "unseen")
+
+        h = 2 * acc1 * acc2 / (acc1 + acc2)
 
         # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
+        is_best = h > best_acc1
+        best_acc1 = max(h, best_acc1)
 
         save_checkpoint({
             'epoch': epoch + 1,
@@ -225,7 +318,7 @@ def main():
     wandb.run.finish()
 
 
-def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args):
+def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion, scaler, epoch, data_set, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -241,6 +334,7 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
     num_batches_per_epoch = len(train_loader)
 
     end = time.time()
+    predicted, label = [], []
     for i, (images, target) in enumerate(tqdm(train_loader)):
 
         # measure data loading time
@@ -256,22 +350,35 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
         target = target.to(device)
         text_tokens = clip.tokenize(texts).to(device)
 
+        np_target = target.cpu().numpy()
+        gt = np.zeros(shape=(len(np_target), len(data_set.seenclasses) + len(data_set.unseenclasses)))
+        for j in range(len(np_target)):
+            gt[j][np_target[j]] = 1
+        sampled_classes = data_set.seenclasses
+        # sampled_classes, inverse_ind = np.unique(np_target, return_inverse=True)
+        gt = gt[:, sampled_classes]
+        ground_truth = torch.from_numpy(gt).float().to(target.device)
+
         # with automatic mixed precision
         with autocast():
             prompted_images = prompter(images)
             output, _ = model(prompted_images, text_tokens)
-            loss = criterion(output, target)
+            loss = criterion(output[:, sampled_classes], ground_truth)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
+
+            predicted.extend(list(torch.max(output.data, 1)[1].cpu().numpy()))
+            label.extend(list(target.cpu().numpy()))
+
         scaler.update()
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         model.logit_scale.data = torch.clamp(model.logit_scale.data, 0, 4.6052)
 
         # measure accuracy
-        acc1 = accuracy(output, target, topk=(1,))
+        acc1 = cal_acc_per_class(predicted, label)
         losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0].item(), images.size(0))
+        top1.update(acc1, images.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -297,11 +404,11 @@ def train(train_loader, texts, model, prompter, optimizer, scheduler, criterion,
     return losses.avg, top1.avg
 
 
-def validate(val_loader, texts, model, prompter, criterion, args):
+def validate(val_loader, texts, model, prompter, criterion, args, data_type):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
-    top1_org = AverageMeter('Original Acc@1', ':6.2f')
-    top1_prompt = AverageMeter('Prompt Acc@1', ':6.2f')
+    top1_org = AverageMeter('Original ' + data_type + ' Acc@1', ':6.2f')
+    top1_prompt = AverageMeter('Prompt ' + data_type + ' Acc@1', ':6.2f')
     progress = ProgressMeter(
         len(val_loader),
         [batch_time, losses, top1_org, top1_prompt],
@@ -309,6 +416,8 @@ def validate(val_loader, texts, model, prompter, criterion, args):
 
     # switch to evaluation mode
     prompter.eval()
+
+    predicted_org, predicted_prompt, label = [], [], []
 
     with torch.no_grad():
         end = time.time()
@@ -324,12 +433,18 @@ def validate(val_loader, texts, model, prompter, criterion, args):
             output_org, _ = model(images, text_tokens)
             loss = criterion(output_prompt, target)
 
+            predicted_org.extend(list(torch.max(output_org.data, 1)[1].cpu().numpy()))
+            predicted_prompt.extend(list(torch.max(output_prompt.data, 1)[1].cpu().numpy()))
+            label.extend(list(target.cpu().numpy()))
+
             # measure accuracy and record loss
-            acc1 = accuracy(output_prompt, target, topk=(1,))
+            # acc1 = accuracy(output_prompt, target, topk=(1,))
+            acc1 = cal_acc_per_class(predicted_prompt, label)
             losses.update(loss.item(), images.size(0))
             top1_prompt.update(acc1[0].item(), images.size(0))
 
-            acc1 = accuracy(output_org, target, topk=(1,))
+            # acc1 = accuracy(output_org, target, topk=(1,))
+            acc1 = cal_acc_per_class(predicted_org, label)
             top1_org.update(acc1[0].item(), images.size(0))
 
             # measure elapsed time
@@ -339,8 +454,8 @@ def validate(val_loader, texts, model, prompter, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
-        print(' * Prompt Acc@1 {top1_prompt.avg:.3f} Original Acc@1 {top1_org.avg:.3f}'
-              .format(top1_prompt=top1_prompt, top1_org=top1_org))
+        print(' * Prompt ' + data_type + ' Acc@1 {top1_prompt.avg:.3f} '.format(top1_prompt=top1_prompt),
+              'Original ' + data_type + ' Acc@1 {top1_org.avg:.3f}'.format(top1_org=top1_org))
 
         if args.use_wandb:
             wandb.log({
@@ -350,6 +465,19 @@ def validate(val_loader, texts, model, prompter, criterion, args):
             })
 
     return top1_prompt.avg
+
+
+def cal_acc_per_class(predicted_list, label_list):
+    predicted_list = np.array(predicted_list)
+    label_list = np.array(label_list)
+    target_classes = np.unique(label_list)
+    acc_per_class = 0
+    for i in target_classes:
+        idx = (label_list == i)
+        acc_per_class += np.sum(label_list[idx] == predicted_list[idx]) / np.sum(idx)
+    acc_per_class /= target_classes.shape[0]
+
+    return acc_per_class
 
 
 if __name__ == '__main__':

@@ -8,19 +8,17 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
 from data.hoi_dataset import BongardDataset
-
 try:
     from torchvision.transforms import InterpolationMode
-
     BICUBIC = InterpolationMode.BICUBIC
 except ImportError:
     BICUBIC = Image.BICUBIC
 
 from data.fewshot_datasets import *
-from data.zeroshot_benchmark import build_zeroshot_benchmark
+from data.zeroshot_benchmark import *
 import data.augmix_ops as augmentations
 
-ID_to_DIRNAME = {
+ID_to_DIRNAME={
     'I': 'ImageNet',
     'A': 'imagenet-a',
     'K': 'ImageNet-Sketch',
@@ -35,13 +33,10 @@ ID_to_DIRNAME = {
     'food101': 'Food101',
     'sun397': 'SUN397',
     'aircraft': 'fgvc_aircraft',
-    'eurosat': 'eurosat',
+    'eurosat': 'eurosat'
 }
 
-zeroshot_dataset = ["CUB"]
-
-
-def build_dataset(set_id, transform, data_root, mode='seen', n_shot=None, split="all", bongard_anno=False):
+def build_dataset(set_id, transform, data_root, mode='test', n_shot=None, split="all", bongard_anno=False):
     if set_id == 'I':
         # ImageNet validation set
         testdir = os.path.join(os.path.join(data_root, ID_to_DIRNAME[set_id]), 'val')
@@ -51,15 +46,13 @@ def build_dataset(set_id, transform, data_root, mode='seen', n_shot=None, split=
         testset = datasets.ImageFolder(testdir, transform=transform)
     elif set_id in fewshot_datasets:
         if mode == 'train' and n_shot:
-            testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform,
-                                            mode=mode, n_shot=n_shot)
+            testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
         else:
-            testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform,
-                                            mode=mode)
-    elif set_id in zeroshot_dataset:
-        if mode == 'seen':
-            testset = build_zeroshot_benchmark(set_id, data_root, transform, mode=mode)
-        elif mode == 'unseen':
+            testset = build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode)
+    elif set_id in zeroshot_benchmark:
+        if mode == 'train':
+            testset = build_zeroshot_benchmark(set_id, data_root, transform, mode=mode, n_shot=n_shot)
+        else:
             testset = build_zeroshot_benchmark(set_id, data_root, transform, mode=mode)
     elif set_id == 'bongard':
         assert isinstance(transform, Tuple)
@@ -67,17 +60,16 @@ def build_dataset(set_id, transform, data_root, mode='seen', n_shot=None, split=
         testset = BongardDataset(data_root, split, mode, base_transform, query_transform, bongard_anno)
     else:
         raise NotImplementedError
-
+        
     return testset
 
 
 # AugMix Transforms
 def get_preaugment():
     return transforms.Compose([
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-    ])
-
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+        ])
 
 def augmix(image, preprocess, aug_list, severity=1):
     preaugment = get_preaugment()
@@ -99,6 +91,24 @@ def augmix(image, preprocess, aug_list, severity=1):
 
 
 class AugMixAugmenter(object):
+    def __init__(self, base_transform, preprocess, n_views=2, augmix=False, 
+                    severity=1):
+        self.base_transform = base_transform
+        self.preprocess = preprocess
+        self.n_views = n_views
+        if augmix:
+            self.aug_list = augmentations.augmentations
+        else:
+            self.aug_list = []
+        self.severity = severity
+        
+    def __call__(self, x):
+        image = self.preprocess(self.base_transform(x))
+        views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
+        return [image] + views
+
+
+class MyAugMixAugmenter(object):
     def __init__(self, base_transform, preprocess, n_views=2, augmix=False,
                  severity=1):
         self.base_transform = base_transform
@@ -115,3 +125,13 @@ class AugMixAugmenter(object):
         views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
         return [image] + views
 
+
+class TrainAugMixAugmenter(object):
+    def __init__(self, preprocess, severity=1):
+        self.preprocess = preprocess
+        self.aug_list = augmentations.augmentations
+        self.severity = severity
+
+    def __call__(self, x):
+        views = augmix(x, self.preprocess, self.aug_list, self.severity)
+        return views
